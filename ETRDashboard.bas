@@ -1,15 +1,19 @@
 Attribute VB_Name = "ETRDashboard"
 Option Explicit
 
-' eTR dashboard v1.0. Desktop Excel for Windows, 32- or 64-bit.
-' Import this module into eTR_Dashboard_Template.xlsx, save as .xlsm,
-' then run ETR_InstallDashboard. No reference libraries or add-ins needed.
-' All source workbooks are opened read-only. No source data are retained.
+' eTR dashboard v2.0. Desktop Excel for Windows, 32- or 64-bit.
+' Start with a blank workbook, save as .xlsm, import this module,
+' then run ETR_InstallDashboard. No template, extra references or add-ins.
+' Creates Dashboard, Configuration and Original Data automatically.
+' Source files are read-only. Original Data retains the last successful
+' selected-sheet snapshot (all rows/columns, values and number formats).
 
 Private Const ERR_BASE As Long = vbObjectError + 741
 Private Const CHUNK_SIZE As Long = 50000
 Private Const MAX_AGE As Long = 2147483646
 Private Const MAX_BUCKETS As Long = 12
+Private Const DEFAULT_SNAPSHOT_CELLS As Long = 10000000
+Private Const SNAPSHOT_CHUNK_CELLS As Long = 250000
 Private mBusy As Boolean
 Private mLastError As String
 
@@ -34,6 +38,7 @@ Private Type Settings
     UnmappedPolicy As String
     TransitKeyMode As String
     MaxDataRows As Long
+    MaxSnapshotCells As Long
     BucketCount As Long
     Buckets() As AgeBucket
 End Type
@@ -50,6 +55,8 @@ Private Type RunMetrics
     MaximumCell As Long
     SourcePath As String
     SourceSheet As String
+    SnapshotLastRow As Long
+    SnapshotLastColumn As Long
     CompletedAt As Date
 End Type
 
@@ -76,34 +83,133 @@ Public Sub ETR_ShowConfiguration()
     ThisWorkbook.Worksheets("Configuration").Activate
 End Sub
 
-Public Sub ETR_InstallDashboard()
-    Dim ws As Worksheet, cfg As Settings, regions As Object, orders As Object
-    On Error GoTo Failed
-    LoadConfiguration cfg, regions, orders
-    Set ws = ThisWorkbook.Worksheets("Dashboard")
-    AddControls ws
-    If CStr(ws.Range("B12").Value2) = "n.a." Then
-        ws.Range("B5").Value2 = "No source loaded. Configure your regions, then use Refresh eTR file."
-    End If
-    ws.Activate
-    ActiveWindow.DisplayGridlines = False
-    MsgBox "Refresh controls are ready. Configure your transit mappings, then select an eTR file.", vbInformation, "eTR dashboard"
-    Exit Sub
-Failed:
-    MsgBox "Setup did not finish: " & Err.Description, vbExclamation, "eTR dashboard"
+Public Sub ETR_ShowOriginalData()
+    ThisWorkbook.Worksheets("Original Data").Activate
 End Sub
+
+Public Sub ETR_InstallDashboard()
+    Call ETR_InitializeWorkbook(True)
+End Sub
+
+' Idempotent setup. Also callable without dialogs by acceptance tests.
+Public Function ETR_InitializeWorkbook(Optional ByVal showMessages As Boolean = True) As Boolean
+    Dim cfgSheet As Worksheet, dashSheet As Worksheet, dataSheet As Worksheet, reusable As Worksheet
+    Dim cfg As Settings, metrics As RunMetrics, regions As Object, orders As Object
+    Dim gross As Object, distinct As Object, oldScreen As Boolean, oldEvents As Boolean
+    Dim oldAlerts As Boolean, stateSaved As Boolean, errorText As String, needsDashboard As Boolean, initializedData As Boolean
+    If mBusy Then
+        mLastError = "An eTR operation is already in progress.": Exit Function
+    End If
+    mBusy = True: mLastError = vbNullString
+    On Error GoTo Failed
+    If ThisWorkbook.ProtectStructure Then Fail "Unprotect the workbook structure before setup."
+    If ThisWorkbook.ReadOnly Then Fail "Save an editable copy before setup."
+    Set cfgSheet = WorksheetOrNothing("Configuration")
+    Set dashSheet = WorksheetOrNothing("Dashboard")
+    Set dataSheet = WorksheetOrNothing("Original Data")
+    If Not dashSheet Is Nothing Then
+        If dashSheet.ProtectContents Or dashSheet.ProtectDrawingObjects Then Fail "Unprotect the Dashboard sheet before setup."
+        If Not SheetIsBlank(dashSheet) Then
+            If CleanText(dashSheet.Range("B2").Value2, "Dashboard title") <> "eTR heatmap dashboard" Then _
+                Fail "Dashboard already contains other content. Rename that sheet before setup."
+        End If
+    End If
+    If Not cfgSheet Is Nothing Then
+        If cfgSheet.ProtectContents Then Fail "Unprotect the Configuration sheet before setup."
+    End If
+    If Not dataSheet Is Nothing Then
+        If Not SheetIsBlank(dataSheet) Then
+            If SheetRole(dataSheet) <> "SourceSnapshot" Then _
+                Fail "Original Data already contains other content. Rename that sheet before setup."
+        End If
+    End If
+    If ThisWorkbook.Worksheets.Count = 1 And dashSheet Is Nothing Then
+        If ThisWorkbook.Worksheets(1).Name <> "Configuration" And ThisWorkbook.Worksheets(1).Name <> "Original Data" Then
+            If SheetIsBlank(ThisWorkbook.Worksheets(1)) Then Set reusable = ThisWorkbook.Worksheets(1)
+        End If
+    End If
+    oldScreen = Application.ScreenUpdating: oldEvents = Application.EnableEvents
+    oldAlerts = Application.DisplayAlerts: stateSaved = True
+    Application.ScreenUpdating = False: Application.EnableEvents = False
+    If cfgSheet Is Nothing Then
+        Set cfgSheet = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        cfgSheet.Name = "Configuration"
+    End If
+    If SheetIsBlank(cfgSheet) Then BuildConfiguration cfgSheet
+    LoadConfiguration cfg, regions, orders
+    If dashSheet Is Nothing Then
+        If reusable Is Nothing Then
+            Set dashSheet = ThisWorkbook.Worksheets.Add(Before:=cfgSheet)
+        Else
+            Set dashSheet = reusable
+        End If
+        dashSheet.Name = "Dashboard"
+    End If
+    needsDashboard = SheetIsBlank(dashSheet)
+    If dataSheet Is Nothing Then
+        Set dataSheet = ThisWorkbook.Worksheets.Add(After:=cfgSheet)
+        dataSheet.Name = "Original Data"
+    End If
+    If SheetIsBlank(dataSheet) Then
+        BuildEmptyOriginalData dataSheet
+        initializedData = True
+    End If
+    If needsDashboard Then
+        Set gross = NewDictionary(vbBinaryCompare): Set distinct = NewDictionary(vbBinaryCompare)
+        RenderDashboard dashSheet, cfg, regions, orders, gross, distinct, metrics, False
+        dashSheet.Calculate
+    Else
+        AddControls dashSheet
+        If CStr(dashSheet.Range("B12").Value2) = "n.a." Then
+            dashSheet.Range("B5").Value2 = "No source loaded. Configure your regions, then use Refresh eTR file."
+        ElseIf initializedData Then
+            dashSheet.Range("B5").Value2 = "Original Data has no source snapshot yet. Refresh to rebuild both output tabs."
+        End If
+    End If
+    MarkSheetRole dashSheet, "Dashboard"
+    dashSheet.Visible = xlSheetVisible: cfgSheet.Visible = xlSheetVisible: dataSheet.Visible = xlSheetVisible
+    If dashSheet.Index <> 1 Then dashSheet.Move Before:=ThisWorkbook.Sheets(1)
+    cfgSheet.Move After:=dashSheet
+    dataSheet.Move After:=cfgSheet
+    cfgSheet.Activate
+    ActiveWindow.DisplayGridlines = False
+    ActiveWindow.FreezePanes = False: ActiveWindow.SplitColumn = 0: ActiveWindow.SplitRow = 5
+    ActiveWindow.FreezePanes = True
+    dataSheet.Activate: ActiveWindow.DisplayGridlines = False
+    dashSheet.Activate: ActiveWindow.DisplayGridlines = False
+    ETR_InitializeWorkbook = True
+    GoTo Finally
+Failed:
+    errorText = Err.Description: mLastError = errorText
+Finally:
+    On Error Resume Next
+    If stateSaved Then
+        Application.EnableEvents = oldEvents: Application.DisplayAlerts = oldAlerts
+        Application.ScreenUpdating = oldScreen
+    End If
+    mBusy = False
+    If showMessages Then
+        If ETR_InitializeWorkbook Then
+            MsgBox "Setup complete: Dashboard, Configuration and Original Data are ready." & vbCrLf & _
+                "Enter your region mappings, select an eTR file, and save this workbook as .xlsm.", vbInformation, "eTR dashboard"
+        Else
+            MsgBox "Setup did not finish: " & errorText, vbExclamation, "eTR dashboard"
+        End If
+    End If
+    On Error GoTo 0
+End Function
 
 Public Function ETR_LastError() As String
     ETR_LastError = mLastError
 End Function
 
 ' Callable without dialogs for integration/testing. Does not save the dashboard file.
-' Every failure before the final sheet swap leaves the prior Dashboard intact.
+' Both published sheets are replaced together after validation and reconciliation.
 Public Function ETR_RefreshFile(ByVal sourcePath As String, Optional ByVal showMessages As Boolean = True) As Boolean
     Dim cfg As Settings, metrics As RunMetrics
     Dim regionByTransit As Object, regionOrder As Object
     Dim gross As Object, distinct As Object
-    Dim sourceBook As Workbook, sourceSheet As Worksheet, staged As Worksheet
+    Dim sourceBook As Workbook, sourceSheet As Worksheet, staged As Worksheet, stagedData As Worksheet, publishedData As Worksheet
     Dim sourceOwned As Boolean, stateSaved As Boolean
     Dim oldScreen As Boolean, oldEvents As Boolean, oldAlerts As Boolean
     Dim oldCalc As XlCalculation, oldSecurity As Long, oldStatus As Variant
@@ -122,6 +228,9 @@ Public Function ETR_RefreshFile(ByVal sourcePath As String, Optional ByVal showM
     ' Check the existing Dashboard before opening any source.
     Set staged = ThisWorkbook.Worksheets("Dashboard")
     Set staged = Nothing
+    Set publishedData = WorksheetOrNothing("Original Data")
+    If publishedData Is Nothing Then Fail "Run ETR_InstallDashboard once to create the Original Data tab."
+    If SheetRole(publishedData) <> "SourceSnapshot" Then Fail "Original Data is not an eTR-managed snapshot. Run setup in a blank workbook."
 
     oldScreen = Application.ScreenUpdating
     oldEvents = Application.EnableEvents
@@ -142,9 +251,14 @@ Public Function ETR_RefreshFile(ByVal sourcePath As String, Optional ByVal showM
     Set sourceSheet = ResolveSourceSheet(sourceBook, cfg, headerCols)
     metrics.SourcePath = sourceBook.FullName
     metrics.SourceSheet = sourceSheet.Name
+    SnapshotBounds sourceSheet, cfg, metrics.SnapshotLastRow, metrics.SnapshotLastColumn
     Set gross = NewDictionary(vbBinaryCompare)
     Set distinct = NewDictionary(vbBinaryCompare)
     AggregateSource sourceSheet, headerCols, cfg, regionByTransit, gross, distinct, metrics
+    Set stagedData = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+    stagedData.Name = UnusedSheetName("_eTR_data")
+    stagedData.Visible = xlSheetVeryHidden
+    CopyOriginalData sourceSheet, stagedData, cfg, metrics
     sourceBook.Close SaveChanges:=False
     sourceOwned = False
     Set sourceBook = Nothing
@@ -160,8 +274,9 @@ Public Function ETR_RefreshFile(ByVal sourcePath As String, Optional ByVal showM
     If CLng(staged.Range("D12").Value2) <> metrics.UniquePairs Then Fail "Unique total reconciliation failed."
     If CLng(staged.Range("F12").Value2) <> metrics.GlobalIds Then Fail "Global TRid reconciliation failed."
     If metrics.UniquePairs > metrics.GrossRows Then Fail "Unique counts exceed gross counts."
-    CommitDashboard staged
+    CommitOutputs staged, stagedData
     Set staged = Nothing
+    Set stagedData = Nothing
     ETR_RefreshFile = True
     GoTo Finally
 
@@ -176,7 +291,12 @@ Finally:
         Application.DisplayAlerts = False
         staged.Delete
     End If
+    If Not stagedData Is Nothing Then
+        Application.DisplayAlerts = False
+        stagedData.Delete
+    End If
     If stateSaved Then
+        Application.CutCopyMode = False
         Application.AutomationSecurity = oldSecurity
         Application.Calculation = oldCalc
         Application.EnableEvents = oldEvents
@@ -186,6 +306,10 @@ Finally:
     End If
     mBusy = False
     If ETR_RefreshFile Then
+        ThisWorkbook.Worksheets("Original Data").Activate
+        ActiveWindow.DisplayGridlines = False
+        ActiveWindow.FreezePanes = False: ActiveWindow.SplitColumn = 0
+        ActiveWindow.SplitRow = cfg.HeaderRow: ActiveWindow.FreezePanes = True
         ThisWorkbook.Worksheets("Dashboard").Activate
         ActiveWindow.DisplayGridlines = False
         If showMessages Then MsgBox "Refresh complete." & vbCrLf & _
@@ -193,7 +317,7 @@ Finally:
             Format$(metrics.UniquePairs, "#,##0") & " unique transit + TRid pairs." & vbCrLf & _
             "Save the dashboard to retain this snapshot.", vbInformation, "eTR dashboard"
     ElseIf showMessages Then
-        MsgBox "Refresh stopped. The previous dashboard is unchanged." & vbCrLf & vbCrLf & _
+        MsgBox "Refresh stopped. The previous Dashboard and Original Data are unchanged." & vbCrLf & vbCrLf & _
             mLastError, vbExclamation, "eTR dashboard"
     End If
     On Error GoTo 0
@@ -243,7 +367,7 @@ Private Function GetTable(ByVal ws As Worksheet, ByVal tableName As String) As L
     On Error Resume Next
     Set GetTable = ws.ListObjects(tableName)
     On Error GoTo 0
-    If GetTable Is Nothing Then Fail "Configuration table is missing: " & tableName & ". Use the supplied template."
+    If GetTable Is Nothing Then Fail "Configuration table is missing: " & tableName & ". Run ETR_InstallDashboard in a blank workbook."
 End Function
 
 Private Function TableColumn(ByVal table As ListObject, ByVal name As String) As Long
@@ -257,6 +381,223 @@ Private Function TableColumn(ByVal table As ListObject, ByVal name As String) As
     If TableColumn = 0 Then Fail "Missing column " & name & " in " & table.Name & "."
 End Function
 
+Private Function WorksheetOrNothing(ByVal name As String) As Worksheet
+    Dim item As Object
+    For Each item In ThisWorkbook.Sheets
+        If StrComp(item.Name, name, vbTextCompare) = 0 Then
+            If TypeOf item Is Worksheet Then
+                Set WorksheetOrNothing = item
+            Else
+                Fail "The reserved name '" & name & "' belongs to a chart sheet. Rename it before setup."
+            End If
+            Exit Function
+        End If
+    Next item
+End Function
+
+Private Function SheetIsBlank(ByVal ws As Worksheet) As Boolean
+    If ws.ListObjects.Count > 0 Or ws.Shapes.Count > 0 Or ws.Hyperlinks.Count > 0 Then Exit Function
+    If ws.Comments.Count > 0 Then Exit Function
+    SheetIsBlank = (Application.CountA(ws.UsedRange) = 0)
+End Function
+
+Private Function SheetRole(ByVal ws As Worksheet) As String
+    Dim item As Object
+    For Each item In ws.CustomProperties
+        If item.Name = "eTRRole" Then SheetRole = CStr(item.Value): Exit Function
+    Next item
+End Function
+
+Private Sub MarkSheetRole(ByVal ws As Worksheet, ByVal role As String)
+    Dim item As Object
+    For Each item In ws.CustomProperties
+        If item.Name = "eTRRole" Then item.Delete: Exit For
+    Next item
+    ws.CustomProperties.Add Name:="eTRRole", Value:=role
+End Sub
+
+Private Sub AddListValidation(ByVal cell As Range, ByVal choices As Variant)
+    With cell.Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, _
+            Formula1:=Join(choices, Application.International(xlListSeparator))
+        .IgnoreBlank = False: .InCellDropdown = True: .ShowError = True
+        .ErrorTitle = "Choose a listed option": .ErrorMessage = "Use the dropdown choices."
+    End With
+End Sub
+
+Private Sub StyleInputTable(ByVal table As ListObject)
+    table.TableStyle = "TableStyleMedium2"
+    With table.HeaderRowRange
+        .Interior.Color = RGB(24, 52, 73): .Font.Color = vbWhite: .Font.Bold = True
+        .WrapText = True: .VerticalAlignment = xlCenter: .RowHeight = 34
+    End With
+    If Not table.DataBodyRange Is Nothing Then
+        table.DataBodyRange.Interior.Color = RGB(255, 243, 204)
+        table.DataBodyRange.Font.Color = RGB(23, 74, 118)
+    End If
+End Sub
+
+Private Sub BuildConfiguration(ByVal ws As Worksheet)
+    Dim defaults As Variant, hints As Variant, mappingHeader(1 To 1, 1 To 3) As Variant
+    Dim bucketData As Variant, grid() As Variant, i As Long, j As Long, table As ListObject
+    With ws.Range("B2:I36")
+        .Font.Name = "Arial": .Font.Size = 10: .Font.Color = RGB(32, 52, 70)
+        .RowHeight = 22: .VerticalAlignment = xlCenter
+    End With
+    ws.Tab.Color = RGB(105, 133, 160)
+    ws.Columns("A").ColumnWidth = 3: ws.Columns("B").ColumnWidth = 28
+    ws.Columns("C").ColumnWidth = 27: ws.Columns("D").ColumnWidth = 13
+    ws.Columns("E").ColumnWidth = 3: ws.Columns("F").ColumnWidth = 23
+    ws.Columns("G:H").ColumnWidth = 13: ws.Columns("I").ColumnWidth = 12
+    PutMerged ws, 2, 2, 9, "Configuration"
+    ws.Range("B2").Font.Size = 16: ws.Range("B2").Font.Bold = True: ws.Rows(2).RowHeight = 30
+    PutMerged ws, 3, 2, 9, "Amber cells are editable. Changes take effect on the next successful refresh."
+    defaults = Array(Array("HeaderRow", 2), Array("FirstDataRow", 3), _
+        Array("DescriptionHeader", "Description"), Array("TransitHeader", "booking_transit"), _
+        Array("TRidHeader", "TRid"), Array("AgeHeader", "AgedDays"), _
+        Array("DescriptionFilter", "New"), Array("FilterMode", "Exact"), Array("SourceSheet", ""), _
+        Array("UnmappedPolicy", "Include"), Array("TransitKeyMode", "Numeric"), _
+        Array("MaxDataRows", 500000), Array("MaxSnapshotCells", DEFAULT_SNAPSHOT_CELLS))
+    hints = Array("Source headers are in row 2 by default.", "First source record; must be below HeaderRow.", _
+        "Match by header name; column A is the current position only.", _
+        "Match by header name; column C is the current position only.", _
+        "Match by header name; column H is the current position only.", _
+        "Match by header name; column M is the current position only.", _
+        "Exact and Contains use this text, ignoring case and outer spaces.", _
+        "Exact, Contains or All. All includes every description.", _
+        "Blank selects the only worksheet with all four required headers.", _
+        "Include groups missing mappings under Unmapped; Error stops refresh.", _
+        "Numeric: 00101 = 101. Text: preserve leading zeros; ignore case.", _
+        "Maximum source row span beginning at FirstDataRow, including gaps.", _
+        "Maximum cells in the complete Original Data snapshot, including blanks inside its bounds.")
+    ReDim grid(1 To UBound(defaults) + 2, 1 To 2)
+    grid(1, 1) = "Setting": grid(1, 2) = "Value"
+    For i = 0 To UBound(defaults)
+        grid(i + 2, 1) = defaults(i)(0): grid(i + 2, 2) = defaults(i)(1)
+        PutMerged ws, i + 6, 4, 9, hints(i)
+        With ws.Range(ws.Cells(i + 6, 4), ws.Cells(i + 6, 9))
+            .Font.Color = RGB(90, 110, 127): .WrapText = True: .RowHeight = 30
+        End With
+    Next i
+    ws.Range("B5:C18").Value2 = grid
+    Set table = ws.ListObjects.Add(xlSrcRange, ws.Range("B5:C18"), , xlYes)
+    table.Name = "tblSettings": StyleInputTable table
+    table.ListColumns(1).DataBodyRange.Interior.Color = RGB(247, 249, 252)
+    ws.Range("C17:C18").NumberFormat = "#,##0"
+    AddListValidation ws.Range("C13"), Array("Exact", "Contains", "All")
+    AddListValidation ws.Range("C15"), Array("Include", "Error")
+    AddListValidation ws.Range("C16"), Array("Numeric", "Text")
+    PutMerged ws, 20, 2, 9, "Header row 2, data row 3. A TRid must have one consistent whole-number AgedDays value."
+    ws.Range("B20:I20").WrapText = True: ws.Rows(20).RowHeight = 30
+    PutMerged ws, 22, 2, 4, "Transit to region mapping"
+    PutMerged ws, 22, 6, 9, "Age buckets (inclusive days)"
+    ws.Range("B22:I22").Font.Bold = True: ws.Rows(22).RowHeight = 28
+    mappingHeader(1, 1) = "booking_transit": mappingHeader(1, 2) = "Region": mappingHeader(1, 3) = "RegionOrder"
+    ws.Range("B23:D23").Value2 = mappingHeader
+    ws.Range("B24").NumberFormat = "@"
+    Set table = ws.ListObjects.Add(xlSrcRange, ws.Range("B23:D24"), , xlYes)
+    table.Name = "tblTransitMapping": StyleInputTable table
+    bucketData = Array(Array("BucketLabel", "MinAge", "MaxAge", "BucketOrder"), _
+        Array("0-2 days", 0, 2, 1), Array("3-5 days", 3, 5, 2), Array("6-10 days", 6, 10, 3), _
+        Array("11-20 days", 11, 20, 4), Array("21+ days", 21, Empty, 5))
+    ReDim grid(1 To 6, 1 To 4)
+    For i = 0 To 5
+        For j = 0 To 3: grid(i + 1, j + 1) = bucketData(i)(j): Next j
+    Next i
+    ws.Range("F23:I28").Value2 = grid
+    Set table = ws.ListObjects.Add(xlSrcRange, ws.Range("F23:I28"), , xlYes)
+    table.Name = "tblAgeBuckets": StyleInputTable table
+    With ws.Range("F30:I32")
+        .Merge: .Value2 = "Use 1-12 buckets covering all whole days from 0, without gaps or overlaps. Leave only the final MaxAge blank."
+        .WrapText = True: .Font.Color = RGB(90, 110, 127)
+    End With
+    With ws.Range("F34:I36")
+        .Merge: .Value2 = "Add rows inside the mapping table. Each transit needs one region. Use one RegionOrder per region. Unmapped is reserved."
+        .WrapText = True: .Font.Color = RGB(90, 110, 127)
+    End With
+    MarkSheetRole ws, "Configuration"
+End Sub
+
+Private Sub BuildEmptyOriginalData(ByVal ws As Worksheet)
+    With ws.Range("A1:H5")
+        .Font.Name = "Arial": .Font.Size = 10: .Font.Color = RGB(32, 52, 70)
+        .ColumnWidth = 16: .RowHeight = 24
+    End With
+    PutMerged ws, 1, 1, 8, "Original Data"
+    ws.Range("A1").Font.Size = 16: ws.Range("A1").Font.Bold = True
+    PutMerged ws, 3, 1, 8, "No source snapshot has been loaded. Use Refresh eTR file on Dashboard."
+    PutMerged ws, 4, 1, 8, "This tab will retain all source rows and columns, including rows excluded by the filter."
+    PutMerged ws, 5, 1, 8, "Values and number formats are retained. Refresh replaces this snapshot after validation."
+    ws.Range("A3:H5").WrapText = True: ws.Rows("3:5").RowHeight = 30
+    ws.Tab.Color = RGB(163, 175, 185)
+    MarkSheetRole ws, "SourceSnapshot"
+End Sub
+
+Private Sub SnapshotBounds(ByVal ws As Worksheet, ByRef cfg As Settings, ByRef lastRow As Long, ByRef lastCol As Long)
+    Dim found As Range
+    Set found = ws.Cells.Find(What:="*", After:=ws.Cells(1, 1), LookIn:=xlFormulas, LookAt:=xlPart, _
+        SearchOrder:=xlByRows, SearchDirection:=xlPrevious, MatchCase:=False, SearchFormat:=False)
+    If found Is Nothing Then Fail "The source worksheet is empty."
+    lastRow = found.Row
+    Set found = ws.Cells.Find(What:="*", After:=ws.Cells(1, 1), LookIn:=xlFormulas, LookAt:=xlPart, _
+        SearchOrder:=xlByColumns, SearchDirection:=xlPrevious, MatchCase:=False, SearchFormat:=False)
+    lastCol = found.Column
+    If lastRow - cfg.FirstDataRow + 1 > cfg.MaxDataRows Then _
+        Fail "The complete source snapshot exceeds MaxDataRows. Check trailing content or increase the limit."
+    If CDbl(lastRow) * CDbl(lastCol) > CDbl(cfg.MaxSnapshotCells) Then _
+        Fail "The complete source snapshot exceeds MaxSnapshotCells. Check trailing content or increase the limit."
+    If ws.Parent.Date1904 <> ThisWorkbook.Date1904 Then _
+        Fail "Source and dashboard use different Excel date systems. Use a source with the same date system to preserve dates."
+End Sub
+
+Private Sub CopyOriginalData(ByVal source As Worksheet, ByVal target As Worksheet, ByRef cfg As Settings, ByRef metrics As RunMetrics)
+    Dim firstRow As Long, lastRow As Long, chunkRows As Long, src As Range, dst As Range, formulas As Range
+    Dim savedNumber As Long, savedMessage As String
+    On Error GoTo Failed
+    chunkRows = SNAPSHOT_CHUNK_CELLS \ metrics.SnapshotLastColumn
+    If chunkRows < 1 Then chunkRows = 1
+    If chunkRows > CHUNK_SIZE Then chunkRows = CHUNK_SIZE
+    For firstRow = 1 To metrics.SnapshotLastRow Step chunkRows
+        lastRow = firstRow + chunkRows - 1
+        If lastRow > metrics.SnapshotLastRow Then lastRow = metrics.SnapshotLastRow
+        Set src = source.Range(source.Cells(firstRow, 1), source.Cells(lastRow, metrics.SnapshotLastColumn))
+        Set dst = target.Range(target.Cells(firstRow, 1), target.Cells(lastRow, metrics.SnapshotLastColumn))
+        src.Copy
+        dst.PasteSpecial Paste:=xlPasteValuesAndNumberFormats
+        Application.CutCopyMode = False
+        Application.StatusBar = "eTR: retaining Original Data through row " & Format$(lastRow, "#,##0") & "..."
+    Next firstRow
+    Set dst = target.Range(target.Cells(1, 1), target.Cells(metrics.SnapshotLastRow, metrics.SnapshotLastColumn))
+    ' Paste only values and number formats; never import source code, formulas or connections.
+    On Error Resume Next
+    Set formulas = dst.SpecialCells(xlCellTypeFormulas)
+    On Error GoTo Failed
+    If Not formulas Is Nothing Then Fail "Original Data unexpectedly contains formulas. Refresh was not committed."
+    If target.Hyperlinks.Count > 0 Then target.Hyperlinks.Delete
+    dst.Font.Name = "Arial": dst.Font.Size = 10
+    target.Range(target.Columns(1), target.Columns(metrics.SnapshotLastColumn)).ColumnWidth = 18
+    With target.Range(target.Cells(cfg.HeaderRow, 1), target.Cells(cfg.HeaderRow, metrics.SnapshotLastColumn))
+        .Interior.Color = RGB(24, 52, 73): .Font.Color = vbWhite: .Font.Bold = True
+        .WrapText = True: .RowHeight = 36
+    End With
+    target.Tab.Color = RGB(163, 175, 185)
+    MarkSheetRole target, "SourceSnapshot"
+    target.CustomProperties.Add Name:="eTRSourcePath", Value:=metrics.SourcePath
+    target.CustomProperties.Add Name:="eTRSourceSheet", Value:=metrics.SourceSheet
+    target.CustomProperties.Add Name:="eTRSnapshotLastRow", Value:=CStr(metrics.SnapshotLastRow)
+    target.CustomProperties.Add Name:="eTRSnapshotLastColumn", Value:=CStr(metrics.SnapshotLastColumn)
+    ' Filtering is a convenience; data validation and snapshot copying must still succeed.
+    On Error Resume Next
+    target.Range(target.Cells(cfg.HeaderRow, 1), target.Cells(metrics.SnapshotLastRow, metrics.SnapshotLastColumn)).AutoFilter
+    On Error GoTo 0
+    Exit Sub
+Failed:
+    savedNumber = Err.Number: savedMessage = Err.Description
+    Application.CutCopyMode = False
+    Err.Raise savedNumber, "eTR Original Data", "Could not retain Original Data: " & savedMessage
+End Sub
+
 Private Sub LoadConfiguration(ByRef cfg As Settings, ByRef regionByTransit As Object, ByRef regionOrder As Object)
     Dim ws As Worksheet, table As ListObject, items As Object, wanted As Object
     Dim values As Variant, key As String, value As Variant, i As Long
@@ -264,7 +605,7 @@ Private Sub LoadConfiguration(ByRef cfg As Settings, ByRef regionByTransit As Ob
     On Error Resume Next
     Set ws = ThisWorkbook.Worksheets("Configuration")
     On Error GoTo 0
-    If ws Is Nothing Then Fail "Configuration sheet is missing. Use the supplied template."
+    If ws Is Nothing Then Fail "Configuration is missing. Run ETR_InstallDashboard first."
     Set table = GetTable(ws, "tblSettings")
     keyCol = TableColumn(table, "Setting")
     valCol = TableColumn(table, "Value")
@@ -294,6 +635,9 @@ Private Sub LoadConfiguration(ByRef cfg As Settings, ByRef regionByTransit As Ob
     cfg.UnmappedPolicy = LCase$(CleanText(RequiredSetting(items, "UnmappedPolicy"), "UnmappedPolicy"))
     cfg.TransitKeyMode = LCase$(CleanText(RequiredSetting(items, "TransitKeyMode"), "TransitKeyMode"))
     cfg.MaxDataRows = WholeNumber(RequiredSetting(items, "MaxDataRows"), 1, 1048574, "MaxDataRows")
+    cfg.MaxSnapshotCells = DEFAULT_SNAPSHOT_CELLS
+    If items.Exists("MaxSnapshotCells") Then _
+        cfg.MaxSnapshotCells = WholeNumber(items("MaxSnapshotCells"), 4, 100000000, "MaxSnapshotCells")
     If cfg.FilterMode <> "exact" And cfg.FilterMode <> "contains" And cfg.FilterMode <> "all" Then Fail "FilterMode must be Exact, Contains or All."
     If cfg.FilterMode <> "all" And Len(cfg.DescriptionFilter) = 0 Then Fail "DescriptionFilter is required unless FilterMode is All."
     If cfg.UnmappedPolicy <> "include" And cfg.UnmappedPolicy <> "error" Then Fail "UnmappedPolicy must be Include or Error."
@@ -446,13 +790,20 @@ Private Function TransactionKey(ByVal value As Variant, ByVal context As String)
 End Function
 
 Private Sub ValidateSourcePath(ByVal sourcePath As String)
-    Dim ext As String, book As Workbook
+    Dim ext As String, book As Workbook, sourceName As String, normalizedPath As String
     If Len(Trim$(sourcePath)) = 0 Then Fail "No source file was selected."
     ext = LCase$(Mid$(sourcePath, InStrRev(sourcePath, ".") + 1))
     If ext <> "xlsx" And ext <> "xlsm" And ext <> "xlsb" Then Fail "Select an .xlsx, .xlsm or .xlsb workbook. Convert legacy .xls or CSV files to .xlsx first."
-    If StrComp(sourcePath, ThisWorkbook.FullName, vbTextCompare) = 0 Then Fail "Select a source workbook, not this dashboard."
+    normalizedPath = Replace(sourcePath, "/", "\")
+    sourceName = Mid$(normalizedPath, InStrRev(normalizedPath, "\") + 1)
+    If StrComp(sourcePath, ThisWorkbook.FullName, vbTextCompare) = 0 Or _
+        StrComp(sourceName, ThisWorkbook.Name, vbTextCompare) = 0 Then Fail "Select a source workbook, not this dashboard."
     For Each book In Application.Workbooks
-        If StrComp(sourcePath, book.FullName, vbTextCompare) = 0 Then Fail "Close the selected source workbook first, saving your changes, then refresh."
+        ' OneDrive may expose FullName as a cloud URL even when the picker gives a local path.
+        ' Excel cannot open two workbooks with the same base filename in one instance.
+        If StrComp(sourcePath, book.FullName, vbTextCompare) = 0 Or _
+            StrComp(sourceName, book.Name, vbTextCompare) = 0 Then _
+            Fail "Close the selected source workbook first, saving your changes, then refresh."
     Next book
 End Sub
 
@@ -672,7 +1023,7 @@ Private Sub PutMerged(ByVal ws As Worksheet, ByVal row As Long, ByVal firstCol A
 End Sub
 
 Private Sub RenderDashboard(ByVal ws As Worksheet, ByRef cfg As Settings, ByVal mapping As Object, ByVal orders As Object, _
-        ByVal gross As Object, ByVal distinct As Object, ByRef metrics As RunMetrics)
+        ByVal gross As Object, ByVal distinct As Object, ByRef metrics As RunMetrics, Optional ByVal hasSource As Boolean = True)
     Dim keys As Variant, lastCol As Long, viewLastCol As Long, grossTotal As Long, uniqueTotal As Long
     Dim starts As Variant, labels As Variant, captions As Variant, i As Long, col As Long, endCol As Long
     Dim uniqueStart As Long, filterText As String, overallLastRow As Long
@@ -707,7 +1058,7 @@ Private Sub RenderDashboard(ByVal ws As Worksheet, ByRef cfg As Settings, ByVal 
         .UnMerge: .Merge: .Font.Size = 16: .Font.Bold = True: .Font.Color = RGB(24, 52, 73)
     End With
     ws.Range(ws.Cells(4, 2), ws.Cells(4, viewLastCol)).Borders(xlEdgeBottom).Color = RGB(24, 52, 73)
-    PutMerged ws, 5, 2, viewLastCol, "Last refresh succeeded. Configuration changes apply on the next refresh."
+    PutMerged ws, 5, 2, viewLastCol, "Last refresh succeeded. Dashboard and Original Data contain the same source snapshot."
     ws.Range(ws.Cells(5, 2), ws.Cells(5, viewLastCol)).Interior.Color = RGB(231, 238, 245)
     ws.Rows(5).RowHeight = 30
     ws.Cells(6, 2).Value2 = "Source file"
@@ -746,19 +1097,30 @@ Private Sub RenderDashboard(ByVal ws As Worksheet, ByRef cfg As Settings, ByVal 
         "; unmapped " & Format$(metrics.UnmappedRows, "#,##0") & " rows across " & CStr(metrics.UnmappedTransits) & " transits."
     ws.Range(ws.Cells(14, 2), ws.Cells(14, viewLastCol)).WrapText = True
     ws.Rows(14).RowHeight = 30
-    grossTotal = RenderHeatmap(ws, 16, "01  Gross eTR rows", keys, gross, mapping, cfg, metrics.MaximumCell)
+    grossTotal = RenderHeatmap(ws, 16, "01  Gross eTR rows", keys, gross, mapping, cfg, metrics.MaximumCell, hasSource)
     uniqueStart = grossTotal + 4
-    uniqueTotal = RenderHeatmap(ws, uniqueStart, "02  Unique eTR by transit", keys, distinct, mapping, cfg, metrics.MaximumCell)
+    uniqueTotal = RenderHeatmap(ws, uniqueStart, "02  Unique eTR by transit", keys, distinct, mapping, cfg, metrics.MaximumCell, hasSource)
     ws.Range("B12").Formula = "=" & ws.Cells(grossTotal, lastCol).Address(False, False)
     ws.Range("D12").Formula = "=" & ws.Cells(uniqueTotal, lastCol).Address(False, False)
     ws.Range("F12").Value2 = metrics.GlobalIds
     ws.Range("H12").Formula = "=B12-D12"
     ws.Range("H13").NumberFormat = "General"
     ws.Range("H13").Formula = "=IF(B12=0,""Rate: n.a."",""Rate: ""&TEXT(H12/B12,""0.0%""))"
+    If Not hasSource Then
+        ws.Range("B5").Value2 = "No source loaded. Configure your regions, then use Refresh eTR file."
+        ws.Range(ws.Cells(5, 2), ws.Cells(5, viewLastCol)).Interior.Color = RGB(255, 243, 204)
+        ws.Range("C6").Value2 = "n.a.": ws.Range("C7").Value2 = "n.a."
+        ws.Range("C8").NumberFormat = "@": ws.Range("C8").Value2 = "n.a."
+        ws.Range("C9").Value2 = filterText & " (pending first refresh); transit mode: " & cfg.TransitKeyMode
+        ws.Range("F12").Value2 = "n.a.": ws.Range("H12").Value2 = "n.a."
+        ws.Range("H13").Value2 = "Gross minus unique"
+        ws.Range("B14").Value2 = "Results remain unavailable until the first successful refresh. Original Data will retain all source rows."
+    End If
     PutMerged ws, uniqueTotal + 3, 2, viewLastCol, "Unique totals count transit + TRid pairs. The same TRid in different transits contributes once in each."
     ws.Range(ws.Cells(uniqueTotal + 3, 2), ws.Cells(uniqueTotal + 3, viewLastCol)).WrapText = True
     ws.Rows(uniqueTotal + 3).RowHeight = 32
     AddControls ws
+    MarkSheetRole ws, "Dashboard"
     ' Page setup is optional; printer availability cannot invalidate correct results.
     On Error Resume Next
     With ws.PageSetup
@@ -769,7 +1131,7 @@ Private Sub RenderDashboard(ByVal ws As Worksheet, ByRef cfg As Settings, ByVal 
 End Sub
 
 Private Function RenderHeatmap(ByVal ws As Worksheet, ByVal topRow As Long, ByVal title As String, ByVal keys As Variant, _
-        ByVal counts As Object, ByVal mapping As Object, ByRef cfg As Settings, ByVal maximum As Long) As Long
+        ByVal counts As Object, ByVal mapping As Object, ByRef cfg As Settings, ByVal maximum As Long, ByVal hasSource As Boolean) As Long
     Dim lastCol As Long, titleLastCol As Long, r As Long, headerRow As Long, firstData As Long
     Dim i As Long, j As Long, firstIndex As Long, lastIndex As Long, subtotal As Long
     Dim region As String, transit As String, rowCounts As Variant, block As Variant
@@ -782,6 +1144,7 @@ Private Function RenderHeatmap(ByVal ws As Worksheet, ByVal topRow As Long, ByVa
         .Font.Size = 12: .Font.Bold = True: .RowHeight = 27
     End With
     PutMerged ws, topRow + 1, 2, titleLastCol, "AgedDays (inclusive). Shared heat-color scale: 0 to " & CStr(maximum) & ". Region rows are subtotals."
+    If Not hasSource Then ws.Cells(topRow + 1, 2).Value2 = "Both heatmaps use the same region, transit and age-bucket layout."
     ws.Range(ws.Cells(topRow + 1, 2), ws.Cells(topRow + 1, titleLastCol)).Font.Color = RGB(90, 110, 127)
     headerRow = topRow + 2
     ReDim header(1 To 1, 1 To cfg.BucketCount + 3)
@@ -838,12 +1201,18 @@ Private Function RenderHeatmap(ByVal ws As Worksheet, ByVal topRow As Long, ByVa
             i = lastIndex + 1
         Loop
     Else
-        PutMerged ws, r, 2, lastCol, "No qualifying records for this filter."
+        If hasSource Then
+            PutMerged ws, r, 2, lastCol, "No qualifying records for this filter."
+        Else
+            PutMerged ws, r, 2, lastCol, "No source workbook has been loaded."
+        End If
         r = r + 1
     End If
     ws.Cells(r, 2).Value2 = "Grand total"
     For j = 4 To lastCol - 1
-        If counts.Count = 0 Then
+        If Not hasSource Then
+            ws.Cells(r, j).Value2 = "n.a."
+        ElseIf counts.Count = 0 Then
             ws.Cells(r, j).Value2 = 0
         Else
             ' Only transit rows have a value in column C. Never sum region totals twice.
@@ -851,7 +1220,11 @@ Private Function RenderHeatmap(ByVal ws As Worksheet, ByVal topRow As Long, ByVa
                 ",""<>""," & ws.Range(ws.Cells(firstData, j), ws.Cells(r - 1, j)).Address & ")"
         End If
     Next j
-    ws.Cells(r, lastCol).FormulaR1C1 = "=SUM(RC4:RC[-1])"
+    If hasSource Then
+        ws.Cells(r, lastCol).FormulaR1C1 = "=SUM(RC4:RC[-1])"
+    Else
+        ws.Cells(r, lastCol).Value2 = "n.a."
+    End If
     ws.Range(ws.Cells(firstData, 4), ws.Cells(r, lastCol)).NumberFormat = "#,##0"
     With ws.Range(ws.Cells(r, 2), ws.Cells(r, lastCol))
         .Interior.Color = RGB(24, 52, 73): .Font.Color = vbWhite: .Font.Bold = True: .RowHeight = 28
@@ -860,16 +1233,16 @@ Private Function RenderHeatmap(ByVal ws As Worksheet, ByVal topRow As Long, ByVa
 End Function
 
 Private Sub ApplyHeatColors(ByVal cells As Range, ByVal maximum As Long)
-    Dim scale As ColorScale, high As Double
+    Dim heatScale As ColorScale, high As Double
     high = maximum: If high < 1 Then high = 1
-    Set scale = cells.FormatConditions.AddColorScale(3)
-    With scale.ColorScaleCriteria(1)
+    Set heatScale = cells.FormatConditions.AddColorScale(3)
+    With heatScale.ColorScaleCriteria(1)
         .Type = xlConditionValueNumber: .Value = 0: .FormatColor.Color = RGB(245, 248, 252)
     End With
-    With scale.ColorScaleCriteria(2)
+    With heatScale.ColorScaleCriteria(2)
         .Type = xlConditionValueNumber: .Value = high / 2: .FormatColor.Color = RGB(249, 211, 144)
     End With
-    With scale.ColorScaleCriteria(3)
+    With heatScale.ColorScaleCriteria(3)
         .Type = xlConditionValueNumber: .Value = high: .FormatColor.Color = RGB(240, 144, 117)
     End With
 End Sub
@@ -879,6 +1252,7 @@ Private Sub AddControls(ByVal ws As Worksheet)
     On Error Resume Next
     ws.Shapes("eTR_Refresh").Delete
     ws.Shapes("eTR_Configure").Delete
+    ws.Shapes("eTR_OriginalData").Delete
     On Error GoTo 0
     ws.Range("H2:I3").UnMerge
     ws.Range("H2:I3").ClearContents
@@ -907,6 +1281,18 @@ Private Sub AddControls(ByVal ws As Worksheet)
         .Fill.ForeColor.RGB = RGB(231, 238, 245): .Line.Visible = 0
         .Placement = xlFreeFloating
     End With
+    Set area = ws.Range("B15:C15")
+    Set button = ws.Shapes.AddShape(5, area.Left, area.Top + 1, 150, area.Height - 2)
+    With button
+        .Name = "eTR_OriginalData": .OnAction = "ETR_ShowOriginalData"
+        .TextFrame2.TextRange.Text = "View Original Data"
+        .TextFrame2.TextRange.Font.Name = "Arial": .TextFrame2.TextRange.Font.Size = 9
+        .TextFrame2.TextRange.Font.Fill.ForeColor.RGB = RGB(24, 52, 73)
+        .TextFrame2.TextRange.ParagraphFormat.Alignment = 2: .TextFrame2.VerticalAnchor = 3
+        .Fill.ForeColor.RGB = RGB(231, 238, 245): .Line.Visible = 0
+        .AlternativeText = "Open the unfiltered source snapshot from the last successful refresh."
+        .Placement = xlFreeFloating
+    End With
 End Sub
 
 Private Function UnusedSheetName(ByVal prefix As String) As String
@@ -922,23 +1308,34 @@ Private Function UnusedSheetName(ByVal prefix As String) As String
     Fail "Cannot allocate a temporary worksheet name."
 End Function
 
-Private Sub CommitDashboard(ByVal staged As Worksheet)
-    Dim current As Worksheet, backupName As String, stagedName As String
-    Dim renamedOld As Boolean, renamedNew As Boolean, oldAlerts As Boolean
+Private Sub CommitOutputs(ByVal staged As Worksheet, ByVal stagedData As Worksheet)
+    Dim current As Worksheet, currentData As Worksheet, backupName As String, backupDataName As String
+    Dim stagedName As String, stagedDataName As String
+    Dim renamedOld As Boolean, renamedNew As Boolean, renamedOldData As Boolean, renamedNewData As Boolean, oldAlerts As Boolean
     Dim number As Long, message As String
     oldAlerts = Application.DisplayAlerts
     On Error GoTo Rollback
     Set current = ThisWorkbook.Worksheets("Dashboard")
+    Set currentData = ThisWorkbook.Worksheets("Original Data")
     backupName = UnusedSheetName("_eTR_previous")
+    backupDataName = UnusedSheetName("_eTR_prior_data")
     stagedName = staged.Name
+    stagedDataName = stagedData.Name
     staged.Visible = xlSheetVisible
+    stagedData.Visible = xlSheetVisible
     staged.Move Before:=current
+    stagedData.Move After:=ThisWorkbook.Worksheets("Configuration")
     current.Name = backupName
     renamedOld = True
+    currentData.Name = backupDataName
+    renamedOldData = True
     staged.Name = "Dashboard"
     renamedNew = True
+    stagedData.Name = "Original Data"
+    renamedNewData = True
     Application.DisplayAlerts = False
-    current.Delete ' Final commit point; no fallible work follows.
+    ' Delete the old pair in one Excel operation, after both replacements are ready.
+    ThisWorkbook.Worksheets(Array(backupName, backupDataName)).Delete
     On Error Resume Next
     Application.DisplayAlerts = oldAlerts
     On Error GoTo 0
@@ -947,9 +1344,12 @@ Rollback:
     number = Err.Number: message = Err.Description
     On Error Resume Next
     Application.DisplayAlerts = oldAlerts
+    If renamedNewData Then stagedData.Name = stagedDataName
     If renamedNew Then staged.Name = stagedName
+    If renamedOldData Then currentData.Name = "Original Data"
     If renamedOld Then current.Name = "Dashboard"
     current.Visible = xlSheetVisible
+    currentData.Visible = xlSheetVisible
     On Error GoTo 0
     Err.Raise number, "eTR dashboard commit", message
 End Sub
