@@ -1,7 +1,7 @@
 Attribute VB_Name = "ETRDashboard"
 Option Explicit
 
-' eTR dashboard v2.1. Desktop Excel for Windows, 32- or 64-bit.
+' eTR dashboard v2.2. Desktop Excel for Windows, 32- or 64-bit.
 ' Start with a blank workbook, save as .xlsm, import this module,
 ' then run ETR_InstallDashboard. No template, extra references or add-ins.
 ' Creates Dashboard, Configuration and Original Data automatically.
@@ -70,7 +70,7 @@ Public Sub RefreshETRDashboard()
         .Title = "Select an eTR source workbook"
         .AllowMultiSelect = False
         .Filters.Clear
-        .Filters.Add "Excel workbooks", "*.xlsx;*.xlsm;*.xlsb"
+        .Filters.Add "Excel workbooks", "*.xls;*.xlsx;*.xlsm;*.xlsb"
         If .Show <> -1 Then Exit Sub ' Cancellation does not change the workbook.
         chosen = .SelectedItems(1)
     End With
@@ -817,7 +817,8 @@ Private Sub ValidateSourcePath(ByVal sourcePath As String)
     Dim ext As String, book As Workbook, sourceName As String, normalizedPath As String
     If Len(Trim$(sourcePath)) = 0 Then Fail "No source file was selected."
     ext = LCase$(Mid$(sourcePath, InStrRev(sourcePath, ".") + 1))
-    If ext <> "xlsx" And ext <> "xlsm" And ext <> "xlsb" Then Fail "Select an .xlsx, .xlsm or .xlsb workbook. Convert legacy .xls or CSV files to .xlsx first."
+    If ext <> "xls" And ext <> "xlsx" And ext <> "xlsm" And ext <> "xlsb" Then _
+        Fail "Select an .xls, .xlsx, .xlsm or .xlsb workbook. Convert CSV files to an Excel workbook first."
     normalizedPath = Replace(sourcePath, "/", "\")
     sourceName = Mid$(normalizedPath, InStrRev(normalizedPath, "\") + 1)
     If StrComp(sourcePath, ThisWorkbook.FullName, vbTextCompare) = 0 Or _
@@ -901,16 +902,23 @@ Private Function DescriptionMatches(ByVal text As String, ByRef cfg As Settings)
 End Function
 
 Private Function ApprovalDay(ByVal value As Variant, ByVal date1904 As Boolean, ByVal asOfDate As Date, ByVal context As String) As Date
-    Dim serial As Double, result As Date, text As String, yyyy As Long, mm As Long, dd As Long
+    Dim serial As Double, result As Date, text As String, yyyy As Long, mm As Long, dd As Long, parts As Variant
     If IsError(value) Then Fail context & " ApprovalDate contains an Excel error."
     If IsEmpty(value) Or IsNull(value) Then Fail context & " ApprovalDate is blank."
     If VarType(value) = vbBoolean Then Fail context & " ApprovalDate must be a valid date."
     If VarType(value) = vbString Then
         text = Trim$(CStr(value))
         If Len(text) = 0 Then Fail context & " ApprovalDate is blank."
-        If Not text Like "####-##-##" Then _
-            Fail context & " ApprovalDate must be an Excel date or ISO text yyyy-mm-dd."
-        yyyy = CLng(Left$(text, 4)): mm = CLng(Mid$(text, 6, 2)): dd = CLng(Right$(text, 2))
+        ' Parse explicit components, never locale-dependent CDate(text).
+        If text Like "####-##-##" Then
+            yyyy = CLng(Left$(text, 4)): mm = CLng(Mid$(text, 6, 2)): dd = CLng(Right$(text, 2))
+        ElseIf text Like "##/##/####" Or text Like "#/##/####" Or _
+                text Like "##/#/####" Or text Like "#/#/####" Then
+            parts = Split(text, "/")
+            mm = CLng(parts(0)): dd = CLng(parts(1)): yyyy = CLng(parts(2))
+        Else
+            Fail context & " ApprovalDate must be an Excel date or text mm/dd/yyyy (month first) or yyyy-mm-dd."
+        End If
         If yyyy < 1900 Or mm < 1 Or mm > 12 Or dd < 1 Or dd > 31 Then GoTo InvalidDate
         On Error GoTo InvalidDate
         result = DateSerial(yyyy, mm, dd)
