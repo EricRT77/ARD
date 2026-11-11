@@ -1,7 +1,7 @@
 Attribute VB_Name = "ETRDashboard"
 Option Explicit
 
-' eTR dashboard v2.0. Desktop Excel for Windows, 32- or 64-bit.
+' eTR dashboard v2.1. Desktop Excel for Windows, 32- or 64-bit.
 ' Start with a blank workbook, save as .xlsm, import this module,
 ' then run ETR_InstallDashboard. No template, extra references or add-ins.
 ' Creates Dashboard, Configuration and Original Data automatically.
@@ -31,7 +31,7 @@ Private Type Settings
     DescriptionHeader As String
     TransitHeader As String
     TRidHeader As String
-    AgeHeader As String
+    ApprovalDateHeader As String
     DescriptionFilter As String
     FilterMode As String
     SourceSheet As String
@@ -57,6 +57,7 @@ Private Type RunMetrics
     SourceSheet As String
     SnapshotLastRow As Long
     SnapshotLastColumn As Long
+    AsOfDate As Date
     CompletedAt As Date
 End Type
 
@@ -136,6 +137,7 @@ Public Function ETR_InitializeWorkbook(Optional ByVal showMessages As Boolean = 
         cfgSheet.Name = "Configuration"
     End If
     If SheetIsBlank(cfgSheet) Then BuildConfiguration cfgSheet
+    UpgradeApprovalSettings cfgSheet
     LoadConfiguration cfg, regions, orders
     If dashSheet Is Nothing Then
         If reusable Is Nothing Then
@@ -221,6 +223,7 @@ Public Function ETR_RefreshFile(ByVal sourcePath As String, Optional ByVal showM
     mBusy = True
     mLastError = vbNullString
     On Error GoTo Failed
+    metrics.AsOfDate = Date ' Capture once, even if a long refresh crosses midnight.
     ValidateSourcePath sourcePath
     LoadConfiguration cfg, regionByTransit, regionOrder
     If ThisWorkbook.ProtectStructure Then Fail "Unprotect the dashboard workbook structure before refreshing."
@@ -455,7 +458,7 @@ Private Sub BuildConfiguration(ByVal ws As Worksheet)
     PutMerged ws, 3, 2, 9, "Amber cells are editable. Changes take effect on the next successful refresh."
     defaults = Array(Array("HeaderRow", 2), Array("FirstDataRow", 3), _
         Array("DescriptionHeader", "Description"), Array("TransitHeader", "booking_transit"), _
-        Array("TRidHeader", "TRid"), Array("AgeHeader", "AgedDays"), _
+        Array("TRidHeader", "TRid"), Array("ApprovalDateHeader", "ApprovalDate"), _
         Array("DescriptionFilter", "New"), Array("FilterMode", "Exact"), Array("SourceSheet", ""), _
         Array("UnmappedPolicy", "Include"), Array("TransitKeyMode", "Numeric"), _
         Array("MaxDataRows", 500000), Array("MaxSnapshotCells", DEFAULT_SNAPSHOT_CELLS))
@@ -463,7 +466,7 @@ Private Sub BuildConfiguration(ByVal ws As Worksheet)
         "Match by header name; column A is the current position only.", _
         "Match by header name; column C is the current position only.", _
         "Match by header name; column H is the current position only.", _
-        "Match by header name; column M is the current position only.", _
+        "Approval date, matched by header name. Age is today minus this date.", _
         "Exact and Contains use this text, ignoring case and outer spaces.", _
         "Exact, Contains or All. All includes every description.", _
         "Blank selects the only worksheet with all four required headers.", _
@@ -488,7 +491,7 @@ Private Sub BuildConfiguration(ByVal ws As Worksheet)
     AddListValidation ws.Range("C13"), Array("Exact", "Contains", "All")
     AddListValidation ws.Range("C15"), Array("Include", "Error")
     AddListValidation ws.Range("C16"), Array("Numeric", "Text")
-    PutMerged ws, 20, 2, 9, "Header row 2, data row 3. A TRid must have one consistent whole-number AgedDays value."
+    PutMerged ws, 20, 2, 9, "Age = refresh date minus ApprovalDate (calendar days). Source AgedDays is ignored."
     ws.Range("B20:I20").WrapText = True: ws.Rows(20).RowHeight = 30
     PutMerged ws, 22, 2, 4, "Transit to region mapping"
     PutMerged ws, 22, 6, 9, "Age buckets (inclusive days)"
@@ -517,6 +520,24 @@ Private Sub BuildConfiguration(ByVal ws As Worksheet)
         .WrapText = True: .Font.Color = RGB(90, 110, 127)
     End With
     MarkSheetRole ws, "Configuration"
+End Sub
+
+Private Sub UpgradeApprovalSettings(ByVal ws As Worksheet)
+    Dim table As ListObject, i As Long, keyCol As Long, valCol As Long, oldRow As Long
+    Set table = GetTable(ws, "tblSettings")
+    keyCol = TableColumn(table, "Setting"): valCol = TableColumn(table, "Value")
+    If table.DataBodyRange Is Nothing Then Exit Sub
+    For i = 1 To table.ListRows.Count
+        If StrComp(CStr(table.DataBodyRange.Cells(i, keyCol).Value2), "ApprovalDateHeader", vbTextCompare) = 0 Then Exit Sub
+        If StrComp(CStr(table.DataBodyRange.Cells(i, keyCol).Value2), "AgeHeader", vbTextCompare) = 0 Then oldRow = i
+    Next i
+    If oldRow = 0 Then Exit Sub
+    table.DataBodyRange.Cells(oldRow, keyCol).Value2 = "ApprovalDateHeader"
+    table.DataBodyRange.Cells(oldRow, valCol).Value2 = "ApprovalDate"
+    If SheetRole(ws) = "Configuration" Then
+        ws.Cells(table.DataBodyRange.Row + oldRow - 1, 4).Value2 = "Approval date, matched by header name. Age is today minus this date."
+        ws.Range("B20").Value2 = "Age = refresh date minus ApprovalDate (calendar days). Source AgedDays is ignored."
+    End If
 End Sub
 
 Private Sub BuildEmptyOriginalData(ByVal ws As Worksheet)
@@ -628,7 +649,10 @@ Private Sub LoadConfiguration(ByRef cfg As Settings, ByRef regionByTransit As Ob
     cfg.DescriptionHeader = CleanText(RequiredSetting(items, "DescriptionHeader"), "DescriptionHeader")
     cfg.TransitHeader = CleanText(RequiredSetting(items, "TransitHeader"), "TransitHeader")
     cfg.TRidHeader = CleanText(RequiredSetting(items, "TRidHeader"), "TRidHeader")
-    cfg.AgeHeader = CleanText(RequiredSetting(items, "AgeHeader"), "AgeHeader")
+    ' Older installations used AgeHeader. Never interpret that column as a date.
+    cfg.ApprovalDateHeader = "ApprovalDate"
+    If items.Exists("ApprovalDateHeader") Then _
+        cfg.ApprovalDateHeader = CleanText(RequiredSetting(items, "ApprovalDateHeader"), "ApprovalDateHeader")
     cfg.DescriptionFilter = CleanText(RequiredSetting(items, "DescriptionFilter", True), "DescriptionFilter")
     cfg.FilterMode = LCase$(CleanText(RequiredSetting(items, "FilterMode"), "FilterMode"))
     cfg.SourceSheet = CleanText(RequiredSetting(items, "SourceSheet", True), "SourceSheet")
@@ -643,7 +667,7 @@ Private Sub LoadConfiguration(ByRef cfg As Settings, ByRef regionByTransit As Ob
     If cfg.UnmappedPolicy <> "include" And cfg.UnmappedPolicy <> "error" Then Fail "UnmappedPolicy must be Include or Error."
     If cfg.TransitKeyMode <> "numeric" And cfg.TransitKeyMode <> "text" Then Fail "TransitKeyMode must be Numeric or Text."
     Set wanted = NewDictionary(vbBinaryCompare)
-    For Each value In Array(cfg.DescriptionHeader, cfg.TransitHeader, cfg.TRidHeader, cfg.AgeHeader)
+    For Each value In Array(cfg.DescriptionHeader, cfg.TransitHeader, cfg.TRidHeader, cfg.ApprovalDateHeader)
         key = HeaderKey(value)
         If wanted.Exists(key) Then Fail "The four configured source headers must be distinct."
         wanted.Add key, True
@@ -819,7 +843,7 @@ Private Function ResolveSourceSheet(ByVal book As Workbook, ByRef cfg As Setting
                 foundDuplicate = duplicate
             ElseIf Len(cfg.SourceSheet) > 0 Then
                 Fail "Worksheet '" & ws.Name & "' is missing required headers in row " & CStr(cfg.HeaderRow) & ": " & _
-                    cfg.DescriptionHeader & ", " & cfg.TransitHeader & ", " & cfg.TRidHeader & ", " & cfg.AgeHeader & "."
+                    cfg.DescriptionHeader & ", " & cfg.TransitHeader & ", " & cfg.TRidHeader & ", " & cfg.ApprovalDateHeader & "."
             End If
         End If
     Next ws
@@ -834,7 +858,7 @@ Private Function MatchHeaders(ByVal ws As Worksheet, ByRef cfg As Settings, ByRe
     Dim wanted As Variant, data As Variant, lastCol As Long, col As Long, i As Long, key As String
     ReDim columns(1 To 4)
     duplicate = vbNullString
-    wanted = Array(cfg.DescriptionHeader, cfg.TransitHeader, cfg.TRidHeader, cfg.AgeHeader)
+    wanted = Array(cfg.DescriptionHeader, cfg.TransitHeader, cfg.TRidHeader, cfg.ApprovalDateHeader)
     lastCol = ws.Cells(cfg.HeaderRow, ws.Columns.Count).End(xlToLeft).Column
     If lastCol < 4 Then Exit Function
     data = ws.Range(ws.Cells(cfg.HeaderRow, 1), ws.Cells(cfg.HeaderRow, lastCol)).Value2
@@ -876,6 +900,44 @@ Private Function DescriptionMatches(ByVal text As String, ByRef cfg As Settings)
     End Select
 End Function
 
+Private Function ApprovalDay(ByVal value As Variant, ByVal date1904 As Boolean, ByVal asOfDate As Date, ByVal context As String) As Date
+    Dim serial As Double, result As Date, text As String, yyyy As Long, mm As Long, dd As Long
+    If IsError(value) Then Fail context & " ApprovalDate contains an Excel error."
+    If IsEmpty(value) Or IsNull(value) Then Fail context & " ApprovalDate is blank."
+    If VarType(value) = vbBoolean Then Fail context & " ApprovalDate must be a valid date."
+    If VarType(value) = vbString Then
+        text = Trim$(CStr(value))
+        If Len(text) = 0 Then Fail context & " ApprovalDate is blank."
+        If Not text Like "####-##-##" Then _
+            Fail context & " ApprovalDate must be an Excel date or ISO text yyyy-mm-dd."
+        yyyy = CLng(Left$(text, 4)): mm = CLng(Mid$(text, 6, 2)): dd = CLng(Right$(text, 2))
+        If yyyy < 1900 Or mm < 1 Or mm > 12 Or dd < 1 Or dd > 31 Then GoTo InvalidDate
+        On Error GoTo InvalidDate
+        result = DateSerial(yyyy, mm, dd)
+        On Error GoTo 0
+        If Year(result) <> yyyy Or Month(result) <> mm Or Day(result) <> dd Then GoTo InvalidDate
+    ElseIf IsNumeric(value) Then
+        serial = Int(CDbl(value)) ' Ignore timestamps; measure calendar days.
+        If date1904 Then
+            If serial < 0 Then GoTo InvalidDate
+            serial = serial + 1462
+        Else
+            If serial < 1 Or serial = 60 Then GoTo InvalidDate ' Excel's fictitious 1900-02-29.
+            If serial < 60 Then serial = serial + 1 ' Excel/OLE dates before March 1900.
+        End If
+        If serial > 2958465 Then GoTo InvalidDate
+        result = CDate(serial)
+    Else
+        GoTo InvalidDate
+    End If
+    If result > asOfDate Then Fail context & " ApprovalDate is in the future (after " & Format$(asOfDate, "yyyy-mm-dd") & ")."
+    ApprovalDay = result
+    Exit Function
+InvalidDate:
+    On Error GoTo 0
+    Fail context & " ApprovalDate is not a valid calendar date."
+End Function
+
 Private Function BucketForAge(ByVal age As Long, ByRef cfg As Settings) As Long
     Dim i As Long
     For i = 1 To cfg.BucketCount
@@ -884,7 +946,7 @@ Private Function BucketForAge(ByVal age As Long, ByRef cfg As Settings) As Long
             Exit Function
         End If
     Next i
-    Fail "AgedDays " & CStr(age) & " does not match an age bucket."
+    Fail "Calculated age " & CStr(age) & " does not match an age bucket."
 End Function
 
 Private Sub IncrementCount(ByVal counts As Object, ByVal transit As String, ByVal bucket As Long, ByVal nBuckets As Long)
@@ -900,12 +962,12 @@ End Sub
 
 Private Sub AggregateSource(ByVal ws As Worksheet, ByRef columns() As Long, ByRef cfg As Settings, _
         ByVal mapping As Object, ByVal gross As Object, ByVal distinct As Object, ByRef metrics As RunMetrics)
-    Dim ageById As Object, pairSeen As Object, unmapped As Object
+    Dim approvalById As Object, pairSeen As Object, unmapped As Object
     Dim lastRow As Long, endRow As Long, startRow As Long, i As Long, j As Long, r As Long
-    Dim descriptions As Variant, transits As Variant, ids As Variant, ages As Variant
+    Dim descriptions As Variant, transits As Variant, ids As Variant, approvals As Variant
     Dim context As String, description As String, transit As String, id As String, pair As String
-    Dim age As Long, bucket As Long, firstSeen As Variant, key As Variant, counts As Variant
-    Set ageById = NewDictionary(vbBinaryCompare)
+    Dim approved As Date, age As Long, bucket As Long, firstSeen As Variant, key As Variant, counts As Variant
+    Set approvalById = NewDictionary(vbBinaryCompare)
     Set pairSeen = NewDictionary(vbBinaryCompare)
     Set unmapped = NewDictionary(vbBinaryCompare)
     For i = 1 To 4
@@ -920,12 +982,12 @@ Private Sub AggregateSource(ByVal ws As Worksheet, ByRef columns() As Long, ByRe
         descriptions = ReadColumn(ws, startRow, endRow, columns(1))
         transits = ReadColumn(ws, startRow, endRow, columns(2))
         ids = ReadColumn(ws, startRow, endRow, columns(3))
-        ages = ReadColumn(ws, startRow, endRow, columns(4))
+        approvals = ReadColumn(ws, startRow, endRow, columns(4))
         For i = 1 To endRow - startRow + 1
             r = startRow + i - 1
             context = "Source row " & CStr(r)
             If IsBlankValue(descriptions(i, 1)) And IsBlankValue(transits(i, 1)) And _
-                    IsBlankValue(ids(i, 1)) And IsBlankValue(ages(i, 1)) Then
+                    IsBlankValue(ids(i, 1)) And IsBlankValue(approvals(i, 1)) Then
                 metrics.BlankRows = metrics.BlankRows + 1
             Else
                 metrics.ReadRows = metrics.ReadRows + 1
@@ -933,15 +995,16 @@ Private Sub AggregateSource(ByVal ws As Worksheet, ByRef columns() As Long, ByRe
                 If DescriptionMatches(description, cfg) Then
                     transit = TransitKey(transits(i, 1), cfg.TransitKeyMode, context)
                     id = TransactionKey(ids(i, 1), context)
-                    age = WholeNumber(ages(i, 1), 0, MAX_AGE, context & " AgedDays")
+                    approved = ApprovalDay(approvals(i, 1), ws.Parent.Date1904, metrics.AsOfDate, context)
+                    age = DateDiff("d", approved, metrics.AsOfDate)
                     bucket = BucketForAge(age, cfg)
-                    If ageById.Exists(id) Then
-                        firstSeen = ageById(id)
-                        If CLng(firstSeen(0)) <> age Then Fail context & ": TRid '" & id & _
-                            "' has AgedDays " & CStr(age) & "; row " & CStr(firstSeen(1)) & _
-                            " has " & CStr(firstSeen(0)) & ". One TRid must have one age, even across transits."
+                    If approvalById.Exists(id) Then
+                        firstSeen = approvalById(id)
+                        If CDbl(firstSeen(0)) <> CDbl(approved) Then Fail context & ": TRid '" & id & _
+                            "' has ApprovalDate " & Format$(approved, "yyyy-mm-dd") & "; row " & CStr(firstSeen(1)) & _
+                            " has " & Format$(CDate(firstSeen(0)), "yyyy-mm-dd") & ". One TRid must have one approval date, even across transits."
                     Else
-                        ageById.Add id, Array(age, r)
+                        approvalById.Add id, Array(CDbl(approved), r)
                     End If
                     If Not mapping.Exists(transit) Then
                         If cfg.UnmappedPolicy = "error" Then Fail context & ": transit " & transit & " has no region mapping."
@@ -964,7 +1027,7 @@ Private Sub AggregateSource(ByVal ws As Worksheet, ByRef columns() As Long, ByRe
         Application.StatusBar = "eTR: read through source row " & Format$(endRow, "#,##0") & "..."
     Next startRow
     metrics.UniquePairs = pairSeen.Count
-    metrics.GlobalIds = ageById.Count
+    metrics.GlobalIds = approvalById.Count
     metrics.UnmappedTransits = unmapped.Count
     If metrics.ReadRows <> metrics.GrossRows + metrics.ExcludedRows Then Fail "Source row reconciliation failed."
     For Each key In gross.Keys
@@ -1073,6 +1136,13 @@ Private Sub RenderDashboard(ByVal ws As Worksheet, ByRef cfg As Settings, ByVal 
     ws.Cells(9, 2).Value2 = "Applied filter"
     If cfg.FilterMode = "all" Then filterText = "All descriptions" Else filterText = cfg.DescriptionFilter & " (" & cfg.FilterMode & ")"
     PutMerged ws, 9, 3, viewLastCol, filterText & "; transit mode: " & cfg.TransitKeyMode
+    If hasSource Then
+        PutMerged ws, 10, 2, viewLastCol, "Age as of " & Format$(metrics.AsOfDate, "yyyy-mm-dd") & " = refresh date minus " & cfg.ApprovalDateHeader & " (calendar days)."
+    Else
+        PutMerged ws, 10, 2, viewLastCol, "Age = refresh date minus ApprovalDate (calendar days). Refresh to update ages."
+    End If
+    ws.Range(ws.Cells(10, 2), ws.Cells(10, viewLastCol)).Font.Color = RGB(90, 110, 127)
+    ws.Range(ws.Cells(10, 2), ws.Cells(10, viewLastCol)).WrapText = True: ws.Rows(10).RowHeight = 26
     starts = Array(2, 4, 6, 8)
     labels = Array("Gross eTR rows", "Unique by transit", "Global TRids", "Duplicates removed")
     captions = Array("Qualifying source rows", "Distinct transit + TRid", "Distinct IDs overall", "Gross minus unique")
@@ -1143,7 +1213,7 @@ Private Function RenderHeatmap(ByVal ws As Worksheet, ByVal topRow As Long, ByVa
     With ws.Range(ws.Cells(topRow, 2), ws.Cells(topRow, titleLastCol))
         .Font.Size = 12: .Font.Bold = True: .RowHeight = 27
     End With
-    PutMerged ws, topRow + 1, 2, titleLastCol, "AgedDays (inclusive). Shared heat-color scale: 0 to " & CStr(maximum) & ". Region rows are subtotals."
+    PutMerged ws, topRow + 1, 2, titleLastCol, "Age from ApprovalDate (days). Shared heat-color scale: 0 to " & CStr(maximum) & ". Region rows are subtotals."
     If Not hasSource Then ws.Cells(topRow + 1, 2).Value2 = "Both heatmaps use the same region, transit and age-bucket layout."
     ws.Range(ws.Cells(topRow + 1, 2), ws.Cells(topRow + 1, titleLastCol)).Font.Color = RGB(90, 110, 127)
     headerRow = topRow + 2
